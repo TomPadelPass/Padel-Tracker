@@ -1,6 +1,9 @@
 """
 Padel court utilisation tracker for Playtomic.
 
+v2: uses curl_cffi to impersonate a real Chrome browser, because Playtomic's
+bot protection returns 403 Forbidden to plain Python requests.
+
 Runs on a schedule (GitHub Actions). Each run:
   1. Finds the club's tenant_id (cached in data/tenant.json after first run).
   2. Fetches availability for today + next 13 days from the public API.
@@ -9,19 +12,17 @@ Runs on a schedule (GitHub Actions). Each run:
        which includes club-blocked hours - same as the grey cells on the site).
   4. Rows for hours that have already passed are never overwritten, so the
      last snapshot before each hour started becomes its final recorded state.
-
-No authentication required - these are the same public endpoints the
-Playtomic website uses.
 """
 
 import csv
 import json
 import os
 import sys
-import urllib.parse
-import urllib.request
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
+
+from curl_cffi import requests as creq
 
 # ---------------- configuration ----------------
 CLUB_NAME_MATCH = "padel pass harpenden"   # case-insensitive substring
@@ -38,18 +39,28 @@ TENANT_CACHE = os.path.join(DATA_DIR, "tenant.json")
 # ------------------------------------------------
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "application/json",
+    "Accept-Language": "en-GB,en;q=0.9",
+    "Origin": "https://playtomic.com",
+    "Referer": "https://playtomic.com/",
     "X-Requested-With": "com.playtomic.web",
 }
 
 
 def get_json(path, params):
-    url = f"{API}{path}?{urllib.parse.urlencode(params)}"
-    req = urllib.request.Request(url, headers=HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.load(resp)
+    url = f"{API}{path}"
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = creq.get(url, params=params, headers=HEADERS,
+                         impersonate="chrome", timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+        except Exception as e:  # noqa: BLE001
+            last_err = str(e)
+        time.sleep(5 * (attempt + 1))
+    sys.exit(f"Request to {path} failed after 3 attempts. Last error: {last_err}")
 
 
 def find_tenant():
